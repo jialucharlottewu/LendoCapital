@@ -143,3 +143,118 @@ def aggregate_returns(df, freq="W", method="simple"):
         agg = df.groupby("ticker").resample(freq)["return"].sum()
 
     return agg.reset_index().rename(columns={"return": "period_return"})
+
+def rolling_stats(df, window=21):
+    """
+    Add rolling mean, volatility, skewness, and kurtosis of daily returns,
+    computed per ticker over a trailing `window`-day period (default 21
+    trading days ≈ 1 calendar month).
+    Requires df to already have a 'return' column (from compute_returns()).
+    """
+    df = df.sort_values(["ticker", "date"]).copy()
+    grp = df.groupby("ticker")["return"]
+    df["roll_mean"] = grp.transform(lambda x: x.rolling(window).mean())
+    df["roll_vol"] = grp.transform(lambda x: x.rolling(window).std())
+    df["roll_skew"] = grp.transform(lambda x: x.rolling(window).skew())
+    df["roll_kurt"] = grp.transform(lambda x: x.rolling(window).kurt())
+    return df
+
+
+def build_equal_weight_portfolio(df):
+    """Daily equal-weight portfolio return: simple average of all tickers' returns each day."""
+    port = df.groupby("date")["return"].mean().reset_index()
+    return port.rename(columns={"return": "portfolio_return"})
+
+
+def build_value_weight_portfolio(df, weights):
+    """
+    Daily value-weight portfolio return, using a fixed weights dict {ticker: weight}.
+    Weights should already be normalized to sum to 1.
+    NOTE: this uses a single, current-day market-cap snapshot as a static weight
+    applied across the whole period — a simplification worth stating explicitly,
+    since real value-weighting uses weights that drift over time as prices change.
+    """
+    df = df.copy()
+    df["weight"] = df["ticker"].map(weights)
+    df = df.dropna(subset=["weight"])
+    df["weighted_return"] = df["return"] * df["weight"]
+    port = df.groupby("date")["weighted_return"].sum().reset_index()
+    return port.rename(columns={"weighted_return": "portfolio_return"})
+
+
+def performance_summary(portfolio_returns, periods_per_year=252, risk_free_rate=0.0):
+    """
+    Compute annualized return, annualized volatility, Sharpe ratio, and max drawdown
+    from a Series of periodic (daily) portfolio returns.
+
+    Annualization convention: periods_per_year=252 assumes DAILY returns
+    (252 trading days/year). If using monthly returns instead, pass periods_per_year=12.
+    """
+    r = portfolio_returns.dropna()
+
+    ann_return = r.mean() * periods_per_year
+    ann_vol = r.std() * np.sqrt(periods_per_year)
+    sharpe = (ann_return - risk_free_rate) / ann_vol
+
+    cumulative = (1 + r).cumprod()
+    running_max = cumulative.cummax()
+    drawdown = (cumulative / running_max) - 1
+    max_drawdown = drawdown.min()
+
+    return {
+        "annualized_return": ann_return,
+        "annualized_volatility": ann_vol,
+        "sharpe_ratio": sharpe,
+        "max_drawdown": max_drawdown,
+    }
+
+def build_value_weight_portfolio_historic(df, shares_hist_dict):
+    """
+    True historical value-weight portfolio: market cap computed as
+    HISTORICAL shares outstanding (from get_shares_full) x HISTORICAL
+    RAW close price (not adj_close - shares data isn't split-rescaled,
+    so pairing it with raw close keeps both values on the same,
+    real-at-the-time basis). Weights use the PREVIOUS day's market cap
+    to avoid look-ahead bias.
+
+    shares_hist_dict: {ticker: pd.Series of shares outstanding, indexed by date}
+    """
+    df = df.sort_values(["ticker", "date"]).copy()
+    df["date"] = pd.to_datetime(df["date"])
+    if df["date"].dt.tz is not None:
+        df["date"] = df["date"].dt.tz_localize(None)
+
+    frames = []
+    for t, shares_series in shares_hist_dict.items():
+        if shares_series is None or shares_series.empty:
+            continue
+        shares_df = shares_series.rename("shares_outstanding").reset_index()
+        shares_df.columns = ["date", "shares_outstanding"]
+        shares_df["date"] = pd.to_datetime(shares_df["date"])
+        if shares_df["date"].dt.tz is not None:
+            shares_df["date"] = shares_df["date"].dt.tz_localize(None)
+        shares_df["ticker"] = t
+        frames.append(shares_df)
+
+    shares_all = pd.concat(frames, ignore_index=True)
+
+    merged = pd.merge_asof(
+        df.sort_values("date"),
+        shares_all.sort_values("date"),
+        on="date",
+        by="ticker",
+        direction="backward"
+    )
+
+    merged["market_cap"] = merged["close"] * merged["shares_outstanding"]
+    merged = merged.dropna(subset=["market_cap"])
+
+    merged = merged.sort_values(["ticker", "date"])
+    merged["market_cap_lag"] = merged.groupby("ticker")["market_cap"].shift(1)
+
+    daily_total = merged.groupby("date")["market_cap_lag"].transform("sum")
+    merged["weight"] = merged["market_cap_lag"] / daily_total
+
+    merged["weighted_return"] = merged["return"] * merged["weight"]
+    port = merged.groupby("date")["weighted_return"].sum().reset_index()
+    return port.rename(columns={"weighted_return": "portfolio_return"})
