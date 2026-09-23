@@ -5,3 +5,4 @@ statsmodels
 matplotlib
 seaborn
 jupyter
+yfinance
