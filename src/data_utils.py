@@ -94,3 +94,52 @@ def check_volume_spikes(df, z_thresh=5):
     log_vol = np.log(df["volume"].replace(0, np.nan))
     stats = log_vol.groupby(df["ticker"]).transform(lambda x: (x - x.mean()) / x.std())
     return df[stats.abs() > z_thresh]
+
+def compute_returns(df, method="simple"):
+    """
+    Add a 'return' column computed from adj_close, per ticker.
+
+    method : "simple" or "log"
+        simple: (P_t / P_t-1) - 1
+        log:    ln(P_t / P_t-1)
+    """
+    if method not in ("simple", "log"):
+        raise ValueError("method must be 'simple' or 'log'")
+
+    df = df.sort_values(["ticker", "date"]).copy()
+
+    if method == "simple":
+        df["return"] = df.groupby("ticker")["adj_close"].pct_change()
+    else:
+        df["return"] = df.groupby("ticker")["adj_close"].transform(
+            lambda x: np.log(x / x.shift(1))
+        )
+
+    return df
+
+
+def aggregate_returns(df, freq="W", method="simple"):
+    """
+    Aggregate daily returns into weekly ('W') or monthly ('ME') returns,
+    compounding correctly rather than summing simple returns.
+
+    Requires df to already have a 'return' column from compute_returns(),
+    computed with the SAME method passed here.
+    """
+    if method not in ("simple", "log"):
+        raise ValueError("method must be 'simple' or 'log'")
+
+    df = df.copy()
+    df["date"] = pd.to_datetime(df["date"])
+    df = df.set_index("date")
+
+    if method == "simple":
+        # Compounding: (1 + r1) * (1 + r2) * ... - 1, NOT summed
+        agg = df.groupby("ticker").resample(freq)["return"].apply(
+            lambda r: (1 + r).prod() - 1
+        )
+    else:
+        # Log returns ARE additive across time, so summing is correct here
+        agg = df.groupby("ticker").resample(freq)["return"].sum()
+
+    return agg.reset_index().rename(columns={"return": "period_return"})
