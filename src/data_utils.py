@@ -3,24 +3,6 @@ import yfinance as yf
 
 
 def load_ohlcv(tickers, start, end, benchmark="SPY"):
-    """
-    Load daily OHLCV data for one or more tickers using yfinance.
-
-    Parameters
-    ----------
-    tickers : list of str
-        e.g. ["AAPL", "MSFT"]
-    start, end : str
-        Date strings, e.g. "2023-01-01"
-    benchmark : str
-        Ticker used to define the expected trading calendar.
-        Any ticker whose trading days disagree with this gets flagged.
-
-    Returns
-    -------
-    pd.DataFrame with columns:
-        date, ticker, open, high, low, close, adj_close, volume
-    """
     all_data = []
 
     for ticker in tickers:
@@ -28,6 +10,10 @@ def load_ohlcv(tickers, start, end, benchmark="SPY"):
         if raw.empty:
             print(f"Warning: no data returned for {ticker}")
             continue
+
+        # Flatten MultiIndex columns if present (newer yfinance versions do this by default)
+        if isinstance(raw.columns, pd.MultiIndex):
+            raw.columns = raw.columns.get_level_values(0)
 
         raw = raw.reset_index()
         raw["ticker"] = ticker
@@ -44,8 +30,9 @@ def load_ohlcv(tickers, start, end, benchmark="SPY"):
 
     df = pd.concat(all_data, ignore_index=True)
 
-    # --- Calendar check against benchmark ---
     bench_raw = yf.download(benchmark, start=start, end=end, progress=False)
+    if isinstance(bench_raw.columns, pd.MultiIndex):
+        bench_raw.columns = bench_raw.columns.get_level_values(0)
     benchmark_days = set(bench_raw.reset_index()["Date"])
 
     for ticker in df["ticker"].unique():
