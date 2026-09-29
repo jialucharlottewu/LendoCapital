@@ -258,3 +258,113 @@ def build_value_weight_portfolio_historic(df, shares_hist_dict):
     merged["weighted_return"] = merged["return"] * merged["weight"]
     port = merged.groupby("date")["weighted_return"].sum().reset_index()
     return port.rename(columns={"weighted_return": "portfolio_return"})
+
+# ---------------------------------------------------------------------------
+# Week 2: fundamentals, shares, and split helpers
+# ---------------------------------------------------------------------------
+import time
+import requests
+
+# SEC requires a User-Agent with a real name and email. Fill in your own.
+SEC_HEADERS = {"User-Agent": "YOUR NAME your_email@example.com"}
+
+
+def get_cik_map():
+    """Ticker -> 10-digit SEC company ID (CIK)."""
+    r = requests.get("https://www.sec.gov/files/company_tickers.json", headers=SEC_HEADERS)
+    r.raise_for_status()
+    return {v["ticker"]: str(v["cik_str"]).zfill(10) for v in r.json().values()}
+
+
+def get_book_equity_history(cik):
+    """
+    Fiscal-year-end book equity from 10-K filings on SEC EDGAR.
+
+    Returns one row per fiscal year-end with the value AS ORIGINALLY REPORTED
+    (each 10-K repeats prior years, possibly restated; we keep the first
+    filing for each year-end) and the date it was filed, so we can confirm
+    the number was public before a given ranking date.
+    """
+    empty = pd.DataFrame(columns=["fy_end", "book_equity", "be_filed"])
+    for concept in ["StockholdersEquity",
+                    "StockholdersEquityIncludingPortionAttributableToNoncontrollingInterest"]:
+        url = f"https://data.sec.gov/api/xbrl/companyconcept/CIK{cik}/us-gaap/{concept}.json"
+        r = requests.get(url, headers=SEC_HEADERS)
+        if r.status_code == 200:
+            break
+    else:
+        return empty
+
+    df = pd.DataFrame(r.json()["units"].get("USD", []))
+    if df.empty:
+        return empty
+    df = df[df["form"] == "10-K"].copy()
+    df["end"] = pd.to_datetime(df["end"])
+    df["filed"] = pd.to_datetime(df["filed"])
+    df = df.sort_values("filed").drop_duplicates("end", keep="first")
+    return df[["end", "val", "filed"]].rename(
+        columns={"end": "fy_end", "val": "book_equity", "filed": "be_filed"}
+    ).reset_index(drop=True)
+
+
+def load_book_equity(tickers, skip=("TSM", "ASML"), pause=0.2):
+    """Book equity history for many tickers, stacked into one DataFrame with a 'ticker' column."""
+    cik_map = get_cik_map()
+    frames = []
+    for tk in tickers:
+        if tk in skip:
+            continue
+        if tk not in cik_map:
+            print(f"Warning: no SEC CIK for {tk}")
+            continue
+        be = get_book_equity_history(cik_map[tk])
+        be["ticker"] = tk
+        frames.append(be)
+        time.sleep(pause)  # SEC allows ~10 requests per second
+    return pd.concat(frames, ignore_index=True)
+
+
+def get_shares_history(tickers, start="2020-06-01"):
+    """Shares outstanding over time per ticker (yfinance), cleaned: tz-naive, deduplicated, sorted."""
+    out = {}
+    for tk in tickers:
+        try:
+            s = yf.Ticker(tk).get_shares_full(start=start)
+            if s is None or s.empty:
+                print(f"Warning: no shares data for {tk}")
+                continue
+            s.index = pd.to_datetime(s.index)
+            if s.index.tz is not None:
+                s.index = s.index.tz_localize(None)
+            out[tk] = s[~s.index.duplicated(keep="last")].sort_index()
+        except Exception as e:
+            print(f"Warning: shares failed for {tk}: {e}")
+    return out
+
+
+def get_splits_history(tickers):
+    """Stock split history per ticker (yfinance), tz-naive. Ratio 10.0 = 10-for-1 split."""
+    out = {}
+    for tk in tickers:
+        s = yf.Ticker(tk).splits
+        if s is not None and not s.empty:
+            s.index = pd.to_datetime(s.index)
+            if s.index.tz is not None:
+                s.index = s.index.tz_localize(None)
+        out[tk] = s
+    return out
+
+
+def split_factor_after(splits, date):
+    """
+    Product of all split ratios AFTER `date`.
+
+    yfinance's 'close' is split-adjusted backwards (e.g. NVDA on 2022-12-30
+    shows ~14.61, but it actually traded at ~146 before its 2024 10:1 split).
+    Multiply a split-adjusted price by this factor to recover the price that
+    actually traded on `date`.
+    """
+    if splits is None or len(splits) == 0:
+        return 1.0
+    later = splits[splits.index > pd.Timestamp(date)]
+    return float(later.prod()) if len(later) else 1.0
