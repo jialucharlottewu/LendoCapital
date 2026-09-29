@@ -192,3 +192,85 @@ def detect_shares_split_adjusted(shares_hist, splits_hist, window_days=365, min_
     if 0.2 < share_adjusted < 0.8:
         print("Warning: mixed evidence on share-count adjustment; inspect the evidence table.")
     return bool(share_adjusted >= 0.5), evidence
+
+
+# ---------------------------------------------------------------------------
+# Momentum (Task 3)
+# ---------------------------------------------------------------------------
+# Dates a ticker started trading as the company itself. Earlier prices belong to a
+# different security (RKLB traded as the SPAC Vector Acquisition until its merger on
+# 2021-08-25, near its $10 cash value), so they are dropped before computing returns.
+LISTING_DATES = {
+    "RKLB": "2021-08-25",
+}
+
+
+def month_end_prices(prices, col="adj_close", end=None, listing_dates=None):
+    """
+    Wide table of prices on each market month-end (last trading day of each month):
+    rows = month-end dates, columns = tickers.
+
+    Uses adj_close (split- and dividend-adjusted), since momentum is a total return.
+    A ticker with no price on a month-end (not yet listed, halted) is NaN there.
+    end: drop month-ends after this date (use it to leave out a partial current month).
+    listing_dates: {ticker: date}; prices before that date are treated as missing
+                   (default LISTING_DATES).
+    """
+    listing_dates = LISTING_DATES if listing_dates is None else listing_dates
+    month_ends = get_ranking_dates(prices, end=end)
+    wide = prices.pivot(index="date", columns="ticker", values=col)
+    for tk, d in listing_dates.items():
+        if tk in wide.columns:
+            wide.loc[wide.index < pd.Timestamp(d), tk] = np.nan
+    return wide.loc[wide.index.isin(month_ends)].sort_index()
+
+
+def momentum_signal(t, me_prices, lookback=12, skip=1, lower=0.05, upper=0.95):
+    """
+    Momentum scoring function for ranking date t (a month-end).
+
+    12-1 momentum = cumulative return from the end of month t-12 to the end of month t-1:
+        mom = price(end of t-1) / price(end of t-12) - 1
+    i.e. the 11 monthly returns t-11 ... t-1. Month t itself is SKIPPED (short-term reversal).
+
+    Every ticker gets a row; tickers without both prices are flagged, not ranked.
+    Then: winsorize (within this date) -> percentile rank. rank_pct = 1 is the biggest
+    past winner = long side.
+    """
+    dates = list(me_prices.index)
+    t = pd.Timestamp(t)
+    if t not in dates:
+        raise ValueError(f"{t.date()} is not a month-end in the price table")
+    i = dates.index(t)
+    if i < lookback:
+        raise ValueError(f"need {lookback} month-ends before {t.date()}")
+    start, end = dates[i - lookback], dates[i - skip]
+
+    # Timing guard: end must be month t-1 and start month t-12, never month t itself
+    t_m = t.to_period("M")
+    assert end.to_period("M") == t_m - skip, "look-back must end at month t-1"
+    assert start.to_period("M") == t_m - lookback, "look-back must start at month t-12"
+    assert end < t, "signal must not use month t"
+
+    df = pd.DataFrame({
+        "rebalance_date": t,
+        "ticker": me_prices.columns,
+        "start_date": start,
+        "end_date": end,
+        "p_start": me_prices.loc[start].values,
+        "p_end": me_prices.loc[end].values,
+    })
+    df["mom"] = df["p_end"] / df["p_start"] - 1
+
+    reason = pd.Series(None, index=df.index, dtype=object)
+    reason[df["p_end"].isna()] = "missing recent price"
+    reason[df["p_start"].isna()] = "less than 12 months of history"
+    df["excluded_reason"] = reason
+
+    ok = df["excluded_reason"].isna()
+    df["mom_w"] = np.nan
+    df["rank_pct"] = np.nan
+    if ok.sum() > 0:
+        df.loc[ok, "mom_w"] = winsorize(df.loc[ok, "mom"], lower, upper)
+        df.loc[ok, "rank_pct"] = rank_cross_section(df.loc[ok, "mom_w"])
+    return df
