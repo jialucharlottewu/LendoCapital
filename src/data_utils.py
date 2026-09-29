@@ -276,33 +276,52 @@ def get_cik_map():
     return {v["ticker"]: str(v["cik_str"]).zfill(10) for v in r.json().values()}
 
 
+def _fetch_concept(cik, concept):
+    """One XBRL concept for one company from SEC EDGAR (with retries if throttled)."""
+    url = f"https://data.sec.gov/api/xbrl/companyconcept/CIK{cik}/us-gaap/{concept}.json"
+    r = None
+    for attempt in range(4):
+        r = requests.get(url, headers=SEC_HEADERS)
+        if r.status_code in (200, 404):
+            break
+        time.sleep(2 * (attempt + 1))
+    if r.status_code == 404:
+        return pd.DataFrame()
+    if r.status_code != 200:
+        print(f"Warning: CIK {cik} {concept}: HTTP {r.status_code}")
+        return pd.DataFrame()
+    return pd.DataFrame(r.json()["units"].get("USD", []))
+
+
 def get_book_equity_history(cik):
     """
     Fiscal-year-end book equity from 10-K filings on SEC EDGAR.
 
-    Returns one row per fiscal year-end with the value AS ORIGINALLY REPORTED
-    (each 10-K repeats prior years, possibly restated; we keep the first
-    filing for each year-end) and the date it was filed, so we can confirm
-    the number was public before a given ranking date.
+    Companies switch XBRL labels over time, so BOTH are fetched and combined:
+      1. StockholdersEquity (equity belonging to the company's shareholders) - preferred
+      2. ...IncludingPortionAttributableToNoncontrollingInterest (total equity) - fallback
+    Values are kept AS ORIGINALLY REPORTED (first 10-K for each year-end, not later
+    restatements), with the filing date so we can confirm they were public by t.
     """
-    empty = pd.DataFrame(columns=["fy_end", "book_equity", "be_filed"])
-    for concept in ["StockholdersEquity",
-                    "StockholdersEquityIncludingPortionAttributableToNoncontrollingInterest"]:
-        url = f"https://data.sec.gov/api/xbrl/companyconcept/CIK{cik}/us-gaap/{concept}.json"
-        r = requests.get(url, headers=SEC_HEADERS)
-        if r.status_code == 200:
-            break
-    else:
+    empty = pd.DataFrame(columns=["fy_end", "book_equity", "be_filed", "be_concept"])
+    parts = []
+    for priority, concept in enumerate(
+            ["StockholdersEquity",
+             "StockholdersEquityIncludingPortionAttributableToNoncontrollingInterest"]):
+        df = _fetch_concept(cik, concept)
+        if df.empty:
+            continue
+        df = df[df["form"] == "10-K"].copy()
+        df["end"] = pd.to_datetime(df["end"])
+        df["filed"] = pd.to_datetime(df["filed"])
+        df = df.sort_values("filed").drop_duplicates("end", keep="first")
+        df["be_concept"] = concept
+        df["priority"] = priority
+        parts.append(df)
+    if not parts:
         return empty
-
-    df = pd.DataFrame(r.json()["units"].get("USD", []))
-    if df.empty:
-        return empty
-    df = df[df["form"] == "10-K"].copy()
-    df["end"] = pd.to_datetime(df["end"])
-    df["filed"] = pd.to_datetime(df["filed"])
-    df = df.sort_values("filed").drop_duplicates("end", keep="first")
-    return df[["end", "val", "filed"]].rename(
+    df = pd.concat(parts).sort_values(["end", "priority"]).drop_duplicates("end", keep="first")
+    return df[["end", "val", "filed", "be_concept"]].rename(
         columns={"end": "fy_end", "val": "book_equity", "filed": "be_filed"}
     ).reset_index(drop=True)
 
@@ -318,10 +337,15 @@ def load_book_equity(tickers, skip=("TSM", "ASML"), pause=0.2):
             print(f"Warning: no SEC CIK for {tk}")
             continue
         be = get_book_equity_history(cik_map[tk])
+        if be.empty:
+            print(f"Warning: no book equity returned for {tk}")
         be["ticker"] = tk
         frames.append(be)
         time.sleep(pause)  # SEC allows ~10 requests per second
-    return pd.concat(frames, ignore_index=True)
+    out = pd.concat(frames, ignore_index=True)
+    out["fy_end"] = pd.to_datetime(out["fy_end"])
+    out["be_filed"] = pd.to_datetime(out["be_filed"])
+    return out
 
 
 def get_shares_history(tickers, start="2020-06-01"):
@@ -351,6 +375,7 @@ def get_splits_history(tickers):
             s.index = pd.to_datetime(s.index)
             if s.index.tz is not None:
                 s.index = s.index.tz_localize(None)
+            s.index = s.index.normalize()   # yfinance stamps splits at 09:30; keep the date only
         out[tk] = s
     return out
 
@@ -366,5 +391,5 @@ def split_factor_after(splits, date):
     """
     if splits is None or len(splits) == 0:
         return 1.0
-    later = splits[splits.index > pd.Timestamp(date)]
+    later = splits[splits.index.normalize() > pd.Timestamp(date).normalize()]
     return float(later.prod()) if len(later) else 1.0

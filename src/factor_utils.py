@@ -44,7 +44,7 @@ def rank_cross_section(s):
 # Value (Task 2)
 # ---------------------------------------------------------------------------
 def compute_bm(t, tickers, be_hist, shares_hist, splits_hist, prices,
-               shares_split_adjusted=False, max_shares_age_days=180):
+               shares_split_adjusted=False, max_shares_age_days=548):
     """
     Book-to-market for ranking date t (last trading day of June, year Y), following
     Fama & French (1992):
@@ -57,6 +57,9 @@ def compute_bm(t, tickers, be_hist, shares_hist, splits_hist, prices,
 
     shares_split_adjusted : set True only if yfinance share counts turn out to be
                             split-adjusted (then 'close' is used as-is).
+    max_shares_age_days   : share counts older than this are flagged as stale. Share
+                            counts move slowly (buybacks of ~1-3%/yr), so 18 months is
+                            allowed; any split in between is applied to the old count.
     """
     t = pd.Timestamp(t)
     Y = t.year
@@ -89,11 +92,21 @@ def compute_bm(t, tickers, be_hist, shares_hist, splits_hist, prices,
         if sh is not None:
             sh = sh[sh.index <= me_date]
             if not sh.empty:
-                r.update(shares=float(sh.iloc[-1]), shares_date=sh.index[-1])
+                n, sh_date = float(sh.iloc[-1]), sh.index[-1]
+                # If a split happened between the last share observation and me_date,
+                # the old ACTUAL count is out of date by the split ratio: scale it forward.
+                if not shares_split_adjusted:
+                    spl = splits_hist.get(tk)
+                    if spl is not None and len(spl):
+                        d = spl.index.normalize()
+                        between = spl[(d > sh_date.normalize()) & (d <= me_date)]
+                        n *= float(between.prod()) if len(between) else 1.0
+                r.update(shares=n, shares_date=sh_date)
 
         rows.append(r)
 
     df = pd.DataFrame(rows)
+    df["shares_age_days"] = (df["me_date"] - df["shares_date"]).dt.days
     df["market_cap"] = df["price"] * df["shares"]
     df["bm"] = df["book_equity"] / df["market_cap"]
 
@@ -101,7 +114,7 @@ def compute_bm(t, tickers, be_hist, shares_hist, splits_hist, prices,
     reason = pd.Series(None, index=df.index, dtype=object)
     stale = (df["me_date"] - df["shares_date"]).dt.days > max_shares_age_days
     reason[df["market_cap"].isna()] = "missing price/shares"
-    reason[stale] = "stale shares data"
+    reason[stale] = "stale shares data (>18 months old)"
     reason[df["book_equity"].isna()] = "no FY t-1 report"
     reason[df["book_equity"] <= 0] = "negative book equity"
     reason[df["ticker"].isin(FOREIGN)] = "foreign currency"
@@ -128,12 +141,14 @@ def value_signal(t, tickers, be_hist, shares_hist, splits_hist, prices,
     return df
 
 
-def detect_shares_split_adjusted(shares_hist, splits_hist, window_days=120):
+def detect_shares_split_adjusted(shares_hist, splits_hist, window_days=365, min_obs=3):
     """
     Work out from the data whether yfinance share counts are already split-adjusted.
 
-    For every split that falls inside a ticker's share history, compare the share
-    count just before vs just after the split:
+    For every real stock split (ratio >= 1.5 or <= 0.67; small "splits" in yfinance are
+    usually spin-offs, where the share count doesn't change) inside a ticker's share
+    history, compare the MEDIAN share count over the year before vs the year after
+    (medians over a year are robust to yfinance's noisy values near split dates):
       - jumps by about the split ratio (e.g. x10) -> counts are ACTUAL historical numbers
       - roughly unchanged                        -> counts are already SPLIT-ADJUSTED
 
@@ -146,19 +161,17 @@ def detect_shares_split_adjusted(shares_hist, splits_hist, window_days=120):
         if splits is None or len(splits) == 0 or sh is None or sh.empty:
             continue
         for split_date, ratio in splits.items():
-            if ratio == 1:
+            if 0.67 < ratio < 1.5:
                 continue
-            before = sh[(sh.index < split_date) &
-                        (sh.index >= split_date - pd.Timedelta(days=window_days))]
-            after = sh[(sh.index > split_date) &
-                       (sh.index <= split_date + pd.Timedelta(days=window_days))]
-            if before.empty or after.empty:
+            w = pd.Timedelta(days=window_days)
+            before = sh[(sh.index < split_date) & (sh.index >= split_date - w)]
+            after = sh[(sh.index > split_date + pd.Timedelta(days=5)) & (sh.index <= split_date + w)]
+            if len(before) < min_obs or len(after) < min_obs:
                 continue
-            observed = after.iloc[0] / before.iloc[-1]
-            # closer (in log terms) to the split ratio -> actual counts; closer to 1 -> adjusted
+            observed = after.median() / before.median()
             looks_adjusted = abs(np.log(observed)) < abs(np.log(observed / ratio))
             rows.append({"ticker": tk, "split_date": split_date, "split_ratio": ratio,
-                         "shares_before": before.iloc[-1], "shares_after": after.iloc[0],
+                         "median_before": before.median(), "median_after": after.median(),
                          "observed_ratio": round(observed, 2), "looks_adjusted": looks_adjusted})
 
     evidence = pd.DataFrame(rows)
