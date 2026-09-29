@@ -262,55 +262,76 @@ def build_value_weight_portfolio_historic(df, shares_hist_dict):
 # ---------------------------------------------------------------------------
 # Week 2: fundamentals, shares, and split helpers
 # ---------------------------------------------------------------------------
+import os
 import time
 import requests
 
-# SEC requires a User-Agent with a real name and email. Fill in your own.
-SEC_HEADERS = {"User-Agent": "YOUR NAME your_email@example.com"}
+
+def _load_sec_user_agent():
+    """
+    Your name + email for SEC requests, read from (in order):
+      1. the SEC_USER_AGENT environment variable, or
+      2. a line  SEC_USER_AGENT=Your Name you@example.com  in the repo's .env file.
+    .env is in .gitignore, so it never gets pushed, and replacing this file never wipes it.
+    """
+    ua = os.environ.get("SEC_USER_AGENT")
+    if ua:
+        return ua
+    env_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", ".env")
+    if os.path.exists(env_path):
+        for line in open(env_path):
+            if line.strip().startswith("SEC_USER_AGENT="):
+                return line.split("=", 1)[1].strip().strip('"').strip("'")
+    raise RuntimeError("Set SEC_USER_AGENT: add a line 'SEC_USER_AGENT=Your Name you@example.com' "
+                       "to the .env file in the repo root.")
+
+
+def _sec_headers():
+    return {"User-Agent": _load_sec_user_agent()}
 
 
 def get_cik_map():
     """Ticker -> 10-digit SEC company ID (CIK)."""
-    r = requests.get("https://www.sec.gov/files/company_tickers.json", headers=SEC_HEADERS)
+    r = requests.get("https://www.sec.gov/files/company_tickers.json", headers=_sec_headers())
     r.raise_for_status()
     return {v["ticker"]: str(v["cik_str"]).zfill(10) for v in r.json().values()}
 
 
-def _fetch_concept(cik, concept):
-    """One XBRL concept for one company from SEC EDGAR (with retries if throttled)."""
-    url = f"https://data.sec.gov/api/xbrl/companyconcept/CIK{cik}/us-gaap/{concept}.json"
+# Some tickers' current SEC ID has no history (e.g. XOM's ticker now points to a new
+# holding-company ID; its past 10-Ks are under the original ExxonMobil ID). Data from
+# all listed IDs is combined.
+CIK_OVERRIDES = {
+    "XOM": ["0000034088", "0002115436"],
+}
+
+# Labels companies use for book equity, in order of preference.
+EQUITY_CONCEPTS = [
+    "StockholdersEquity",                                                        # parent shareholders
+    "StockholdersEquityIncludingPortionAttributableToNoncontrollingInterest",   # total, incl. minority
+]
+
+
+def _fetch_company_facts(cik):
+    """All us-gaap facts for one company (one request), with retries if the SEC throttles."""
+    url = f"https://data.sec.gov/api/xbrl/companyfacts/CIK{cik}.json"
     r = None
     for attempt in range(4):
-        r = requests.get(url, headers=SEC_HEADERS)
+        r = requests.get(url, headers=_sec_headers())
         if r.status_code in (200, 404):
             break
         time.sleep(2 * (attempt + 1))
-    if r.status_code == 404:
-        return pd.DataFrame()
     if r.status_code != 200:
-        print(f"Warning: CIK {cik} {concept}: HTTP {r.status_code}")
-        return pd.DataFrame()
-    return pd.DataFrame(r.json()["units"].get("USD", []))
-
-
-EQUITY_CONCEPTS = [
-    "StockholdersEquity",
-    "StockholdersEquityIncludingPortionAttributableToNoncontrollingInterest",
-]
+        print(f"Warning: CIK {cik}: HTTP {r.status_code}")
+        return {}
+    return r.json().get("facts", {}).get("us-gaap", {})
 
 
 def find_equity_concepts(cik, since_year=2019):
     """
-    Diagnostic: list every us-gaap label a company has used for anything 'equity'-like
-    in 10-K filings, with how many fiscal year-ends it covers since `since_year`.
-    Use it when get_book_equity_history() comes back empty or stops early.
+    Diagnostic: every us-gaap label a company has used for anything 'equity'-like in
+    10-K filings, with how many fiscal year-ends it covers since `since_year`.
     """
-    url = f"https://data.sec.gov/api/xbrl/companyfacts/CIK{cik}.json"
-    r = requests.get(url, headers=SEC_HEADERS)
-    print(f"CIK {cik}: HTTP {r.status_code}")
-    if r.status_code != 200:
-        return pd.DataFrame()
-    facts = r.json().get("facts", {}).get("us-gaap", {})
+    facts = _fetch_company_facts(cik)
     rows = []
     for name, body in facts.items():
         if "Equity" not in name:
@@ -323,57 +344,74 @@ def find_equity_concepts(cik, since_year=2019):
         if len(k):
             rows.append({"concept": name, "n_year_ends": k["end"].nunique(),
                          "latest_end": k["end"].max()})
-    return pd.DataFrame(rows).sort_values("n_year_ends", ascending=False)
+    out = pd.DataFrame(rows, columns=["concept", "n_year_ends", "latest_end"])
+    if out.empty:
+        print(f"  CIK {cik}: no 10-K equity values since {since_year} ({len(facts)} us-gaap labels)")
+    return out.sort_values("n_year_ends", ascending=False)
 
 
-def get_book_equity_history(cik, concepts=None):
+def get_book_equity_history(ciks, concepts=None):
     """
     Fiscal-year-end book equity from 10-K filings on SEC EDGAR.
 
-    Companies switch XBRL labels over time, so BOTH are fetched and combined:
-      1. StockholdersEquity (equity belonging to the company's shareholders) - preferred
-      2. ...IncludingPortionAttributableToNoncontrollingInterest (total equity) - fallback
-    Values are kept AS ORIGINALLY REPORTED (first 10-K for each year-end, not later
-    restatements), with the filing date so we can confirm they were public by t.
+    ciks     : one CIK, or a list of CIKs whose data is combined
+    concepts : labels to try, in order of preference (default EQUITY_CONCEPTS).
+               Companies switch labels over time, so all are read and, for each
+               year-end, the most preferred available label is kept.
+
+    Values are AS ORIGINALLY REPORTED (the first 10-K that reported each year-end,
+    not later restatements), with the filing date so we can confirm they were
+    public by the ranking date.
     """
+    ciks = [ciks] if isinstance(ciks, str) else list(ciks)
     concepts = concepts or EQUITY_CONCEPTS
-    empty = pd.DataFrame(columns=["fy_end", "book_equity", "be_filed", "be_concept"])
+    cols = ["fy_end", "book_equity", "be_filed", "be_concept"]
     parts = []
-    for priority, concept in enumerate(concepts):
-        df = _fetch_concept(cik, concept)
-        if df.empty:
-            continue
-        df = df[df["form"] == "10-K"].copy()
-        df["end"] = pd.to_datetime(df["end"])
-        df["filed"] = pd.to_datetime(df["filed"])
-        df = df.sort_values("filed").drop_duplicates("end", keep="first")
-        df["be_concept"] = concept
-        df["priority"] = priority
-        parts.append(df)
+    for cik in ciks:
+        facts = _fetch_company_facts(cik)
+        for priority, concept in enumerate(concepts):
+            usd = pd.DataFrame(facts.get(concept, {}).get("units", {}).get("USD", []))
+            if usd.empty or "form" not in usd:
+                continue
+            df = usd[usd["form"] == "10-K"].copy()
+            if df.empty:
+                continue
+            df["end"] = pd.to_datetime(df["end"])
+            df["filed"] = pd.to_datetime(df["filed"])
+            df["be_concept"] = concept
+            df["priority"] = priority
+            parts.append(df)
+        if len(ciks) > 1:
+            time.sleep(0.2)
     if not parts:
-        return empty
-    df = pd.concat(parts).sort_values(["end", "priority"]).drop_duplicates("end", keep="first")
+        return pd.DataFrame(columns=cols)
+    df = pd.concat(parts, ignore_index=True)
+    # original number for each (year-end, label): the first filing that reported it
+    df = df.sort_values("filed").drop_duplicates(["end", "be_concept"], keep="first")
+    # then the most preferred label for each year-end
+    df = df.sort_values(["end", "priority"]).drop_duplicates("end", keep="first")
     return df[["end", "val", "filed", "be_concept"]].rename(
         columns={"end": "fy_end", "val": "book_equity", "filed": "be_filed"}
     ).reset_index(drop=True)
 
 
-def load_book_equity(tickers, skip=("TSM", "ASML"), pause=0.2):
+def load_book_equity(tickers, skip=("TSM", "ASML"), pause=0.3):
     """Book equity history for many tickers, stacked into one DataFrame with a 'ticker' column."""
     cik_map = get_cik_map()
     frames = []
     for tk in tickers:
         if tk in skip:
             continue
-        if tk not in cik_map:
+        ciks = CIK_OVERRIDES.get(tk) or cik_map.get(tk)
+        if ciks is None:
             print(f"Warning: no SEC CIK for {tk}")
             continue
-        be = get_book_equity_history(cik_map[tk])
+        be = get_book_equity_history(ciks)
         if be.empty:
             print(f"Warning: no book equity returned for {tk}")
         be["ticker"] = tk
         frames.append(be)
-        time.sleep(pause)  # SEC allows ~10 requests per second
+        time.sleep(pause)  # stay well under the SEC's ~10 requests/second
     out = pd.concat(frames, ignore_index=True)
     out["fy_end"] = pd.to_datetime(out["fy_end"])
     out["be_filed"] = pd.to_datetime(out["be_filed"])
