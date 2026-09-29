@@ -43,12 +43,23 @@ def rank_cross_section(s):
 # ---------------------------------------------------------------------------
 # Value (Task 2)
 # ---------------------------------------------------------------------------
+def fiscal_year(fy_end):
+    """
+    The fiscal year a year-end belongs to. Some firms use 52/53-week years that end on
+    the weekend closest to Dec 31, so a year-end can land in the first days of January
+    (e.g. JNJ's FY2022 ended 2023-01-01). Year-ends in the first two weeks of January
+    count as the previous year; everything else uses the calendar year of the year-end.
+    """
+    return (pd.to_datetime(fy_end) - pd.Timedelta(days=14)).dt.year
+
+
 def compute_bm(t, tickers, be_hist, shares_hist, splits_hist, prices,
                shares_split_adjusted=False, max_shares_age_days=548):
     """
     Book-to-market for ranking date t (last trading day of June, year Y), following
     Fama & French (1992):
-      book equity : fiscal year ending in calendar year Y-1, filed on or before t
+      book equity : fiscal year ending in calendar year Y-1 (see fiscal_year() for
+                    52/53-week years ending in early January), filed on or before t
       market cap  : actual traded price x shares outstanding, on the last trading
                     day of December Y-1
 
@@ -76,7 +87,7 @@ def compute_bm(t, tickers, be_hist, shares_hist, splits_hist, prices,
         # Book equity: FY ending in Y-1, and already filed by t
         be = be_hist.get(tk)
         if be is not None and not be.empty:
-            cand = be[(be["fy_end"].dt.year == Y - 1) & (be["be_filed"] <= t)]
+            cand = be[(fiscal_year(be["fy_end"]) == Y - 1) & (be["be_filed"] <= t)]
             if not cand.empty:
                 last = cand.sort_values("fy_end").iloc[-1]
                 r.update(fy_end=last["fy_end"], be_filed=last["be_filed"],

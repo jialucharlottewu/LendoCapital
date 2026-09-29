@@ -293,7 +293,40 @@ def _fetch_concept(cik, concept):
     return pd.DataFrame(r.json()["units"].get("USD", []))
 
 
-def get_book_equity_history(cik):
+EQUITY_CONCEPTS = [
+    "StockholdersEquity",
+    "StockholdersEquityIncludingPortionAttributableToNoncontrollingInterest",
+]
+
+
+def find_equity_concepts(cik, since_year=2019):
+    """
+    Diagnostic: list every us-gaap label a company has used for anything 'equity'-like
+    in 10-K filings, with how many fiscal year-ends it covers since `since_year`.
+    Use it when get_book_equity_history() comes back empty or stops early.
+    """
+    url = f"https://data.sec.gov/api/xbrl/companyfacts/CIK{cik}.json"
+    r = requests.get(url, headers=SEC_HEADERS)
+    print(f"CIK {cik}: HTTP {r.status_code}")
+    if r.status_code != 200:
+        return pd.DataFrame()
+    facts = r.json().get("facts", {}).get("us-gaap", {})
+    rows = []
+    for name, body in facts.items():
+        if "Equity" not in name:
+            continue
+        usd = pd.DataFrame(body.get("units", {}).get("USD", []))
+        if usd.empty or "form" not in usd:
+            continue
+        k = usd[usd["form"] == "10-K"]
+        k = k[pd.to_datetime(k["end"]).dt.year >= since_year]
+        if len(k):
+            rows.append({"concept": name, "n_year_ends": k["end"].nunique(),
+                         "latest_end": k["end"].max()})
+    return pd.DataFrame(rows).sort_values("n_year_ends", ascending=False)
+
+
+def get_book_equity_history(cik, concepts=None):
     """
     Fiscal-year-end book equity from 10-K filings on SEC EDGAR.
 
@@ -303,11 +336,10 @@ def get_book_equity_history(cik):
     Values are kept AS ORIGINALLY REPORTED (first 10-K for each year-end, not later
     restatements), with the filing date so we can confirm they were public by t.
     """
+    concepts = concepts or EQUITY_CONCEPTS
     empty = pd.DataFrame(columns=["fy_end", "book_equity", "be_filed", "be_concept"])
     parts = []
-    for priority, concept in enumerate(
-            ["StockholdersEquity",
-             "StockholdersEquityIncludingPortionAttributableToNoncontrollingInterest"]):
+    for priority, concept in enumerate(concepts):
         df = _fetch_concept(cik, concept)
         if df.empty:
             continue
