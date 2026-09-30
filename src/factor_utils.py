@@ -355,3 +355,33 @@ def form_quintile_portfolios(signals, fwd, score_col="rank_pct", tiebreak_col=No
     returns = pd.DataFrame(ret_rows).set_index("return_date")
     holdings = pd.concat(hold, ignore_index=True)
     return returns, holdings
+
+
+# ---------------------------------------------------------------------------
+# Performance summary (Task 5)
+# ---------------------------------------------------------------------------
+def performance_table(returns, cols=("Q1", "Q2", "Q3", "Q4", "Q5", "long_short"), periods_per_year=12):
+    """
+    One row per portfolio: annualized return, volatility, Sharpe ratio, max drawdown
+    (from Week 1's performance_summary), plus hit rate (share of positive months),
+    average monthly return, t-statistic of the mean, and number of months.
+    Risk-free rate = 0: fine for the long-short (a zero-cost portfolio), but it flatters
+    the long-only quintiles' Sharpe ratios.
+    """
+    from data_utils import performance_summary
+    rows = {}
+    for c in cols:
+        r = returns[c].dropna()
+        p = performance_summary(r, periods_per_year=periods_per_year)
+        p["hit_rate"] = (r > 0).mean()
+        p["avg_monthly"] = r.mean()
+        p["t_stat"] = r.mean() / r.std() * np.sqrt(len(r))
+        p["n_months"] = len(r)
+        rows[c] = p
+    return pd.DataFrame(rows).T
+
+
+def drawdown(returns):
+    """Drawdown series: how far cumulative growth is below its previous peak."""
+    growth = (1 + returns).cumprod()
+    return growth / growth.cummax() - 1
