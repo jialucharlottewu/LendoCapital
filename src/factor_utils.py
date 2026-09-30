@@ -274,3 +274,84 @@ def momentum_signal(t, me_prices, lookback=12, skip=1, lower=0.05, upper=0.95):
         df.loc[ok, "mom_w"] = winsorize(df.loc[ok, "mom"], lower, upper)
         df.loc[ok, "rank_pct"] = rank_cross_section(df.loc[ok, "mom_w"])
     return df
+
+
+# ---------------------------------------------------------------------------
+# Quintile portfolios (Task 4) - one function for both factors
+# ---------------------------------------------------------------------------
+def forward_returns(me_prices):
+    """
+    Each stock's return over the month AFTER each month-end:
+        fwd.loc[t, ticker] = price(end of t+1) / price(end of t) - 1
+    This is what a portfolio formed at the close of month t earns. The last
+    month-end has no following month, so its row is NaN.
+    """
+    return me_prices.shift(-1) / me_prices - 1
+
+
+def carry_forward_signal(signals, month_ends):
+    """
+    Hold each ranking until the next ranking date. Value is ranked once a year (June),
+    so the June ranking is used at every month-end until the next June. Adds a `date`
+    column (the month-end the ranking is used at) next to `rebalance_date` (when it was
+    formed). Only uses rankings formed on or before each date, so there is no look-ahead.
+    """
+    formed = sorted(pd.to_datetime(signals["rebalance_date"].unique()))
+    rows = []
+    for d in month_ends:
+        past = [f for f in formed if f <= d]
+        if past:
+            rows.append({"date": d, "rebalance_date": past[-1]})
+    mapping = pd.DataFrame(rows)
+    return mapping.merge(signals, on="rebalance_date", how="left")
+
+
+def form_quintile_portfolios(signals, fwd, score_col="rank_pct", tiebreak_col=None,
+                             date_col="date", n_groups=5, long_high=True):
+    """
+    Sort stocks into quintiles on `score_col` at each date, and measure each quintile's
+    EQUAL-WEIGHT return over the FOLLOWING month.
+
+    signals     : one row per (date, ticker) with a score; unranked stocks have NaN score
+    fwd         : forward_returns(me_prices) - next-month return for each month-end
+    tiebreak_col: raw score used to order stocks tied after winsorizing
+    long_high   : True  -> long-short = Q5 - Q1 (high score is the long side)
+                  False -> long-short = Q1 - Q5
+                  Fixed by the Task 1 design, never chosen from results.
+
+    Returns (returns, holdings):
+      returns  : one row per return month: Q1..Q5, long_short, and stocks per quintile
+      holdings : every stock's quintile and next-month return at each date
+    """
+    month_ends = list(fwd.index)
+    ret_rows, hold = [], []
+    for d, g in signals.groupby(date_col):
+        d = pd.Timestamp(d)
+        i = month_ends.index(d)
+        if i + 1 >= len(month_ends):
+            continue                                  # no following month to earn a return in
+        ret_date = month_ends[i + 1]
+        # Lag guard: the score formed at the close of month t earns the return of month t+1
+        assert ret_date.to_period("M") == d.to_period("M") + 1
+
+        g = g[g[score_col].notna()].copy()
+        g["fwd_ret"] = g["ticker"].map(fwd.loc[d])
+        g = g[g["fwd_ret"].notna()]
+        if len(g) < n_groups:
+            continue
+        keys = [score_col] + ([tiebreak_col] if tiebreak_col else [])
+        g = g.sort_values(keys + ["ticker"]).reset_index(drop=True)
+        g["quintile"] = pd.qcut(np.arange(len(g)), n_groups, labels=range(1, n_groups + 1)).astype(int)
+        g["return_date"] = ret_date
+        hold.append(g[[date_col, "return_date", "ticker", score_col, "quintile", "fwd_ret"]])
+
+        q = g.groupby("quintile")["fwd_ret"].mean()
+        row = {"formation_date": d, "return_date": ret_date}
+        row.update({f"Q{k}": q[k] for k in range(1, n_groups + 1)})
+        row["long_short"] = (q[n_groups] - q[1]) if long_high else (q[1] - q[n_groups])
+        row.update({f"n_Q{k}": int((g["quintile"] == k).sum()) for k in range(1, n_groups + 1)})
+        ret_rows.append(row)
+
+    returns = pd.DataFrame(ret_rows).set_index("return_date")
+    holdings = pd.concat(hold, ignore_index=True)
+    return returns, holdings
