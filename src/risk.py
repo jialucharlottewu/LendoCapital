@@ -228,3 +228,141 @@ def diversification_curve(returns, sizes=None, n_draws=500, periods_per_year=Non
         "n_universe": N,
     })
     return curve
+
+
+# ---------------------------------------------------------------------------
+# Allocation methods and backtest (Task 3)
+# ---------------------------------------------------------------------------
+def equal_weights(cov):
+    """1/N in every stock. Uses no estimates at all (cov is taken only for its tickers)."""
+    n = len(cov)
+    return pd.Series(1.0 / n, index=cov.index)
+
+
+def inverse_vol_weights(cov):
+    """Weight proportional to 1 / volatility: calmer stocks get more money. Ignores correlation."""
+    inv = 1.0 / np.sqrt(np.diag(cov))
+    return pd.Series(inv / inv.sum(), index=cov.index)
+
+
+def risk_contributions(w, cov):
+    """
+    Share of portfolio variance coming from each stock:  w_i x (cov w)_i / (w' cov w).
+    The shares sum to 1.
+    """
+    w = np.asarray(w, dtype=float)
+    c = np.asarray(cov, dtype=float)
+    marginal = c @ w
+    return w * marginal / (w @ marginal)
+
+
+def risk_parity_weights(cov, tol=1e-10, max_iter=10_000):
+    """
+    Equal risk contribution: every stock adds the same share of portfolio variance.
+    Unlike inverse volatility, it uses the full covariance, so a stock that moves with
+    many others gets less weight than its volatility alone would give it.
+
+    Solved by cyclical coordinate descent (Griveau-Billion, Richard and Roncalli, 2013):
+    for each stock in turn, solve  c_ii w_i^2 + (sum_j!=i c_ij w_j) w_i - 1/N = 0  for
+    w_i > 0, repeat until weights stop changing, then rescale to sum to 1.
+    """
+    c = np.asarray(cov, dtype=float)
+    n = len(c)
+    b = 1.0 / n
+    w = 1.0 / np.sqrt(np.diag(c))
+    w = w / w.sum()                                  # start from inverse volatility
+    for _ in range(max_iter):
+        w_old = w.copy()
+        for i in range(n):
+            rest = c[i] @ w - c[i, i] * w[i]
+            w[i] = (-rest + np.sqrt(rest ** 2 + 4 * c[i, i] * b)) / (2 * c[i, i])
+        if np.max(np.abs(w - w_old)) < tol:
+            break
+    w = w / w.sum()
+    rc = risk_contributions(w, c)
+    assert np.allclose(rc, 1.0 / n, atol=1e-6), "risk parity did not converge"
+    return pd.Series(w, index=cov.index)
+
+
+ALLOCATORS = {
+    "Equal weight": equal_weights,
+    "Inverse volatility": inverse_vol_weights,
+    "Risk parity": risk_parity_weights,
+}
+
+
+def concentration_stats(w, cov=None):
+    """
+    How concentrated one set of weights is:
+      max_weight        largest single position
+      top10_weight      share of the book in the 10 largest positions
+      effective_n       1 / sum(w^2): number of equal positions with the same concentration
+      effective_n_risk  same measure on risk contributions (needs cov): how many stocks
+                        really drive the portfolio's risk
+    """
+    w = pd.Series(w).sort_values(ascending=False)
+    out = {
+        "n_stocks": int((w > 0).sum()),
+        "max_weight": w.iloc[0],
+        "min_weight": w.iloc[-1],
+        "top10_weight": w.iloc[:10].sum(),
+        "effective_n": 1.0 / (w ** 2).sum(),
+    }
+    if cov is not None:
+        rc = risk_contributions(w.values, cov.loc[w.index, w.index].values)
+        out["effective_n_risk"] = 1.0 / (rc ** 2).sum()
+    return out
+
+
+def backtest_allocation(daily_returns, monthly_returns, method, rebalance_dates, lookback=252):
+    """
+    Monthly-rebalanced backtest of one allocation method. Every method gets the SAME
+    universe and the SAME schedule, so results differ only because of the weights.
+
+    At each rebalance date t (a month-end):
+      1. eligible stocks = those with a full `lookback` days of daily returns up to t
+      2. covariance from those daily returns, using data up to and including t only
+      3. weights = method(covariance)
+      4. hold the weights to the next month-end; portfolio return = sum(w x stock return)
+
+    Turnover: within the month the weights drift with prices. At the next rebalance,
+    turnover = 0.5 x sum|new weight - drifted weight| (one-way: share of the book traded).
+    The first build is not counted.
+
+    daily_returns   : wide daily returns (dates x tickers)
+    monthly_returns : wide month-end to month-end returns, indexed by the month-end it ends on
+    Returns (returns, weights, turnover): portfolio returns indexed by the month they are
+    earned in, a weights table (one row per rebalance date), and turnover per rebalance.
+    """
+    allocator = ALLOCATORS[method] if isinstance(method, str) else method
+    month_ends = monthly_returns.index
+    rets, weights, turnover = {}, {}, {}
+    drifted = None
+    for t in rebalance_dates:
+        nxt = month_ends[month_ends > t]
+        if len(nxt) == 0:
+            break
+        nxt = nxt[0]
+        window = daily_returns.loc[:t].tail(lookback)
+        eligible = window.columns[window.notna().all()]
+        eligible = eligible[monthly_returns.loc[nxt, eligible].notna()]
+        cov = window[eligible].cov() * 252
+        w = allocator(cov)
+        assert abs(w.sum() - 1) < 1e-9 and (w >= 0).all()
+
+        if drifted is not None:
+            all_names = w.index.union(drifted.index)
+            turnover[t] = 0.5 * (w.reindex(all_names, fill_value=0)
+                                 - drifted.reindex(all_names, fill_value=0)).abs().sum()
+
+        r = monthly_returns.loc[nxt, w.index]
+        port = (w * r).sum()
+        rets[nxt] = port
+        weights[t] = w
+        drifted = w * (1 + r) / (1 + port)
+
+    returns = pd.Series(rets, name=method if isinstance(method, str) else "portfolio")
+    returns.index.name = "return_date"
+    weights = pd.DataFrame(weights).T.fillna(0.0)
+    weights.index.name = "rebalance_date"
+    return returns, weights, pd.Series(turnover, name="turnover")
