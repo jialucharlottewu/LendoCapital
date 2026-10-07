@@ -8,8 +8,11 @@ all on one stated, annualized basis.
 Annualization follows the data's actual frequency (daily -> 252, weekly -> 52,
 monthly -> 12), inferred from the dates unless you pass periods_per_year yourself.
 """
+import inspect
+
 import numpy as np
 import pandas as pd
+from scipy.optimize import minimize
 
 PERIODS_PER_YEAR = {"daily": 252, "weekly": 52, "monthly": 12, "quarterly": 4, "annual": 1}
 
@@ -329,12 +332,15 @@ def backtest_allocation(daily_returns, monthly_returns, method, rebalance_dates,
     turnover = 0.5 x sum|new weight - drifted weight| (one-way: share of the book traded).
     The first build is not counted.
 
+    method          : a name in ALLOCATORS, or a function of cov (or of mu and cov, in which
+                      case expected returns = trailing mean daily return x 252 are passed too)
     daily_returns   : wide daily returns (dates x tickers)
     monthly_returns : wide month-end to month-end returns, indexed by the month-end it ends on
     Returns (returns, weights, turnover): portfolio returns indexed by the month they are
     earned in, a weights table (one row per rebalance date), and turnover per rebalance.
     """
     allocator = ALLOCATORS[method] if isinstance(method, str) else method
+    needs_mu = "mu" in inspect.signature(allocator).parameters
     month_ends = monthly_returns.index
     rets, weights, turnover = {}, {}, {}
     drifted = None
@@ -347,7 +353,10 @@ def backtest_allocation(daily_returns, monthly_returns, method, rebalance_dates,
         eligible = window.columns[window.notna().all()]
         eligible = eligible[monthly_returns.loc[nxt, eligible].notna()]
         cov = window[eligible].cov() * 252
-        w = allocator(cov)
+        if needs_mu:                                   # e.g. mean-variance: also needs expected returns
+            w = allocator(mu=window[eligible].mean() * 252, cov=cov)
+        else:
+            w = allocator(cov)
         assert abs(w.sum() - 1) < 1e-9 and (w >= 0).all()
 
         if drifted is not None:
@@ -366,3 +375,147 @@ def backtest_allocation(daily_returns, monthly_returns, method, rebalance_dates,
     weights = pd.DataFrame(weights).T.fillna(0.0)
     weights.index.name = "rebalance_date"
     return returns, weights, pd.Series(turnover, name="turnover")
+
+
+# ---------------------------------------------------------------------------
+# Mean-variance optimization (Task 4)
+# ---------------------------------------------------------------------------
+SECTORS = {
+    "AAPL": "Tech", "ADBE": "Tech", "AMD": "Tech", "ASML": "Tech", "AVGO": "Tech", "CRM": "Tech",
+    "CRWD": "Tech", "CSCO": "Tech", "INTC": "Tech", "MSFT": "Tech", "MU": "Tech", "NVDA": "Tech",
+    "ORCL": "Tech", "PLTR": "Tech", "QCOM": "Tech", "SMCI": "Tech", "STX": "Tech", "TSM": "Tech",
+    "TXN": "Tech", "WDC": "Tech",
+    "GOOGL": "Communication", "META": "Communication", "NFLX": "Communication",
+    "AMZN": "Consumer discretionary", "HD": "Consumer discretionary", "MCD": "Consumer discretionary",
+    "NKE": "Consumer discretionary", "TSLA": "Consumer discretionary",
+    "COST": "Consumer staples", "KO": "Consumer staples", "PEP": "Consumer staples",
+    "PG": "Consumer staples", "WMT": "Consumer staples",
+    "ABT": "Healthcare", "JNJ": "Healthcare", "MRK": "Healthcare", "PFE": "Healthcare",
+    "TMO": "Healthcare", "UNH": "Healthcare",
+    "BAC": "Financials", "JPM": "Financials", "MA": "Financials", "V": "Financials", "WFC": "Financials",
+    "CAT": "Industrials", "GE": "Industrials", "HON": "Industrials", "RKLB": "Industrials",
+    "CVX": "Energy", "XOM": "Energy",
+}
+
+
+def mean_variance_weights(mu, cov, objective="max_sharpe", target_return=None, max_weight=1.0,
+                          sectors=None, sector_cap=None, rf=0.0):
+    """
+    Long-only mean-variance optimizer, solved with scipy.optimize.minimize (SLSQP).
+
+    mu, cov       : annualized expected returns (Series) and covariance (DataFrame), same tickers
+    objective     : "min_variance"  - lowest variance (ignores mu)
+                    "max_sharpe"    - highest (w'mu - rf) / sqrt(w' cov w)
+                    "target_return" - lowest variance with w'mu = target_return (frontier points)
+                    "max_return"    - highest w'mu (the top end of the frontier)
+    Constraints   : weights sum to 1; 0 <= w <= max_weight (long-only, position cap);
+                    optional sector caps: sectors = {ticker: sector}, sector_cap = a number
+                    (same cap for every sector) or {sector: cap}.
+    If no stock's expected return beats rf, no portfolio has a positive Sharpe ratio and
+    "max_sharpe" falls back to the minimum-variance portfolio.
+    """
+    tickers = list(cov.index)
+    m = np.asarray(pd.Series(mu).reindex(tickers), dtype=float)
+    c = np.asarray(cov, dtype=float)
+    n = len(tickers)
+    if max_weight * n < 1 - 1e-12:
+        raise ValueError(f"max_weight {max_weight} too small for {n} stocks")
+
+    # sector membership masks and caps
+    groups = []
+    if sectors is not None and sector_cap is not None:
+        for sec in sorted({sectors[t] for t in tickers}):
+            cap = sector_cap[sec] if isinstance(sector_cap, dict) else sector_cap
+            groups.append((np.array([sectors[t] == sec for t in tickers], dtype=float), cap))
+
+    if objective == "max_sharpe":
+        ex = m - rf
+        if (ex <= 0).all():
+            # no stock is expected to beat rf, so no portfolio has a positive Sharpe ratio
+            return mean_variance_weights(mu, cov, "min_variance", max_weight=max_weight,
+                                         sectors=sectors, sector_cap=sector_cap)
+        # Max Sharpe solved in its convex form: minimize y' cov y subject to y'(mu - rf) = 1,
+        # y >= 0, then w = y / sum(y). Caps scale with sum(y): y_i <= max_weight x sum(y).
+        cons = [{"type": "eq", "fun": lambda y: y @ ex - 1, "jac": lambda y: ex}]
+        if max_weight < 1:
+            A = np.eye(n) - max_weight * np.ones((n, n))
+            cons.append({"type": "ineq", "fun": lambda y: -(A @ y), "jac": lambda y: -A})
+        for k, cap in groups:
+            g = k - cap * np.ones(n)
+            cons.append({"type": "ineq", "fun": lambda y, g=g: -(g @ y), "jac": lambda y, g=g: -g})
+        y0 = np.full(n, 1.0 / max(np.full(n, 1.0 / n) @ ex, 1e-3))
+        res = minimize(lambda y: y @ c @ y, y0, jac=lambda y: 2 * c @ y, method="SLSQP",
+                       bounds=[(0.0, None)] * n, constraints=cons,
+                       options={"ftol": 1e-14, "maxiter": 2000})
+        if not res.success:
+            raise RuntimeError(f"optimizer failed ({objective}): {res.message}")
+        w = np.clip(res.x, 0, None)
+        w = w / w.sum()
+        w[w < 1e-6] = 0.0
+        return pd.Series(w / w.sum(), index=tickers)
+
+    cons = [{"type": "eq", "fun": lambda w: w.sum() - 1, "jac": lambda w: np.ones(n)}]
+    if objective == "target_return":
+        cons.append({"type": "eq", "fun": lambda w: w @ m - target_return, "jac": lambda w: m})
+    for k, cap in groups:
+        cons.append({"type": "ineq", "fun": lambda w, k=k, cp=cap: cp - k @ w, "jac": lambda w, k=k: -k})
+
+    if objective in ("min_variance", "target_return"):
+        f, jac = (lambda w: w @ c @ w), (lambda w: 2 * c @ w)
+    elif objective == "max_return":
+        f, jac = (lambda w: -(w @ m)), (lambda w: -m)
+    else:
+        raise ValueError(f"unknown objective {objective}")
+
+    res = minimize(f, np.full(n, 1.0 / n), jac=jac, method="SLSQP", bounds=[(0.0, max_weight)] * n,
+                   constraints=cons, options={"ftol": 1e-12, "maxiter": 2000})
+    if not res.success:
+        raise RuntimeError(f"optimizer failed ({objective}): {res.message}")
+    w = np.clip(res.x, 0, None)
+    w[w < 1e-6] = 0.0
+    return pd.Series(w / w.sum(), index=tickers)
+
+
+def efficient_frontier(mu, cov, n_points=30, **constraints):
+    """
+    Efficient frontier under the given constraints (max_weight, sectors, sector_cap):
+    the lowest-volatility portfolio for each target return, from the minimum-variance
+    portfolio's return up to the highest return the constraints allow.
+    Returns a table of target points (expected return, volatility, Sharpe) and, in
+    .attrs["weights"], the weights at each point.
+    """
+    mu = pd.Series(mu).reindex(cov.index)
+    lo = mean_variance_weights(mu, cov, "min_variance", **constraints) @ mu
+    hi = mean_variance_weights(mu, cov, "max_return", **constraints) @ mu
+    rows, weights = [], {}
+    for target in np.linspace(lo, hi - 1e-6 * abs(hi), n_points):
+        try:
+            w = mean_variance_weights(mu, cov, "target_return", target_return=target, **constraints)
+        except RuntimeError:
+            continue
+        ret, vol = w @ mu, np.sqrt(w @ cov.values @ w)
+        rows.append({"exp_return": ret, "volatility": vol, "sharpe": ret / vol, "n_stocks": int((w > 0).sum())})
+        weights[round(ret, 6)] = w
+    out = pd.DataFrame(rows)
+    out.attrs["weights"] = pd.DataFrame(weights).T
+    return out
+
+
+def bootstrap_weights(daily_returns, allocator, n_boot=200, periods_per_year=252, seed=0):
+    """
+    Sensitivity of an allocation to estimation error. Re-draws the history (days sampled
+    with replacement), re-estimates expected returns and covariance, and recomputes the
+    weights each time. Every redrawn history is statistically just as plausible as the
+    real one, so the spread of the weights shows how much of the allocation is noise.
+    Returns a table: one row per redraw, one column per stock.
+    """
+    r = daily_returns.dropna()
+    needs_mu = "mu" in inspect.signature(allocator).parameters
+    rng = np.random.default_rng(seed)
+    out = []
+    for _ in range(n_boot):
+        sample = r.iloc[rng.integers(0, len(r), len(r))]
+        cov = sample.cov() * periods_per_year
+        w = allocator(mu=sample.mean() * periods_per_year, cov=cov) if needs_mu else allocator(cov)
+        out.append(w)
+    return pd.DataFrame(out).reset_index(drop=True)
