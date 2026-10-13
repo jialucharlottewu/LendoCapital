@@ -519,3 +519,28 @@ def bootstrap_weights(daily_returns, allocator, n_boot=200, periods_per_year=252
         w = allocator(mu=sample.mean() * periods_per_year, cov=cov) if needs_mu else allocator(cov)
         out.append(w)
     return pd.DataFrame(out).reset_index(drop=True)
+
+
+# ---------------------------------------------------------------------------
+# Portfolio analytics from holdings (Task 5)
+# ---------------------------------------------------------------------------
+def turnover_from_holdings(holdings, group, group_col="quintile", date_col="date",
+                           ret_col="fwd_ret", periods_per_year=12):
+    """
+    Annualized one-way turnover of an equal-weight portfolio rebuilt each period from a
+    holdings table (one row per stock per formation date, with the return it then earned).
+
+    Weights drift with each stock's return over the holding period; at the next formation
+    date, turnover = 0.5 x sum|new weight - drifted weight|. The first build is not counted.
+    Returns (annual turnover, average number of names held).
+    """
+    h = holdings[holdings[group_col] == group]
+    turns, drifted = [], None
+    for _, g in h.groupby(date_col, sort=True):
+        w = pd.Series(1.0 / len(g), index=g["ticker"].values)
+        if drifted is not None:
+            names = w.index.union(drifted.index)
+            turns.append(0.5 * (w.reindex(names, fill_value=0) - drifted.reindex(names, fill_value=0)).abs().sum())
+        r = pd.Series(g[ret_col].values, index=g["ticker"].values).fillna(0)
+        drifted = w * (1 + r) / (1 + (w * r).sum())
+    return float(np.mean(turns)) * periods_per_year, h.groupby(date_col).size().mean()
