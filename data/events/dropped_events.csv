@@ -1,6 +1,9 @@
 event_id,ticker,day0,reason
 PLTR_2021-08-12,PLTR,2021-08-12,missing returns in the estimation window (short history)
-RKLB_2021-11-16,RKLB,2021-11-16,missing returns in the estimation window (short history)
-RKLB_2022-03-24,RKLB,2022-03-24,missing returns in the estimation window (short history)
 RKLB_2022-05-17,RKLB,2022-05-17,missing returns in the estimation window (short history)
 RKLB_2022-08-12,RKLB,2022-08-12,missing returns in the estimation window (short history)
+RKLB_2021-11-16,RKLB,2021-11-16,announcement date does not match the SEC 8-K filing
+RKLB_2022-03-24,RKLB,2022-03-24,announcement date does not match the SEC 8-K filing
+COST_2023-06-01,COST,2023-06-01,announcement date does not match the SEC 8-K filing
+COST_2024-06-06,COST,2024-06-06,announcement date does not match the SEC 8-K filing
+SMCI_2025-02-26,SMCI,2025-02-26,announcement date does not match the SEC 8-K filing
