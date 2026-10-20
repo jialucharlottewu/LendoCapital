@@ -334,3 +334,98 @@ def cross_check_dates(events, filings, before=1, after=3, search=30):
     out["date_check"] = np.where(out["sec_gap_days"].isna(), "no 8-K",
                                  np.where(out["sec_gap_days"].between(-before, after), "match", "mismatch"))
     return out
+
+
+# ---------------------------------------------------------------------------
+# Task 3: normal returns, abnormal returns (AR) and cumulative abnormal returns (CAR)
+# ---------------------------------------------------------------------------
+NORMAL_MODELS = ("market_model", "market_adjusted", "mean_adjusted")
+
+
+def fit_market_model(stock, market):
+    """
+    Ordinary least squares fit of  stock return = alpha + beta x market return + error
+    on one estimation window. Returns alpha, beta, the residual standard deviation
+    (n - 2 degrees of freedom; the per-day noise used for t-tests in Task 4), R-squared
+    and the number of days used.
+    """
+    y = np.asarray(stock, dtype=float)
+    x = np.asarray(market, dtype=float)
+    beta = np.cov(x, y, ddof=1)[0, 1] / np.var(x, ddof=1)
+    alpha = y.mean() - beta * x.mean()
+    resid = y - alpha - beta * x
+    return {"alpha": alpha, "beta": beta, "sigma": np.sqrt((resid ** 2).sum() / (len(y) - 2)),
+            "r2": 1 - (resid ** 2).sum() / ((y - y.mean()) ** 2).sum(), "n_est": len(y)}
+
+
+def normal_return(params, market, model="market_model"):
+    """The return expected without the event, under the chosen normal-return model."""
+    if model == "market_model":
+        return params["alpha"] + params["beta"] * market
+    if model == "market_adjusted":
+        return market                                   # beta fixed at 1, alpha at 0
+    if model == "mean_adjusted":
+        return params["mean"] + 0 * market              # the stock's own estimation-window mean
+    raise ValueError(f"model must be one of {NORMAL_MODELS}")
+
+
+def compute_abnormal_returns(windows, stock_returns, market_returns, design, model="market_model"):
+    """
+    Daily abnormal returns for every event and every day of its event window.
+
+    For each event: fit the model on the estimation window ONLY (est_first..est_last),
+    then for each event-window day: AR = actual return - normal return.
+
+    Returns (ar, params):
+      ar     : one row per event and event day, with rel_day (-10..+10), date, the stock
+               and market return, the normal return and the abnormal return
+      params : one row per event with alpha, beta, sigma, R-squared and estimation-window size
+    """
+    cal = stock_returns.index
+    rows, params = [], []
+    for w in windows.itertuples(index=False):
+        r, m = stock_returns[w.ticker], market_returns
+        est = cal[(cal >= w.est_first) & (cal <= w.est_last)]
+        p = fit_market_model(r.loc[est], m.loc[est])
+        p["mean"] = r.loc[est].mean()
+        params.append({"event_id": w.event_id, **p})
+
+        i0 = cal.get_loc(w.day0)
+        days = cal[i0 + design.event_start: i0 + design.event_end + 1]
+        nr = normal_return(p, m.loc[days].values, model)
+        rows.append(pd.DataFrame({
+            "event_id": w.event_id, "ticker": w.ticker,
+            "rel_day": np.arange(design.event_start, design.event_end + 1), "date": days,
+            "ret": r.loc[days].values, "mkt": m.loc[days].values, "normal": nr,
+            "ar": r.loc[days].values - nr,
+        }))
+    return pd.concat(rows, ignore_index=True), pd.DataFrame(params)
+
+
+def car(ar, first, last):
+    """CAR(first, last) for every event: the sum of its daily ARs from rel_day first to last, inclusive."""
+    sel = ar[(ar["rel_day"] >= first) & (ar["rel_day"] <= last)]
+    out = sel.groupby("event_id").agg(car=("ar", "sum"), days=("ar", "size"))
+    assert (out["days"] == last - first + 1).all(), "some event is missing days in the CAR window"
+    return out["car"].rename(f"CAR({first:+d},{last:+d})")
+
+
+def event_car_table(ar, windows, design):
+    """Event-level table: each event's description, its day-0 AR and the CARs fixed in the design."""
+    cars = pd.concat([car(ar, *design.main_car), car(ar, *design.drift_car),
+                      car(ar, design.event_start, -2), car(ar, design.event_start, design.event_end)], axis=1)
+    ar0 = ar[ar["rel_day"] == 0].set_index("event_id")["ar"].rename("AR(0)")
+    keep = ["event_id", "ticker", "day0", "timing", "surprise", "surprise_sign"]
+    return windows[keep].set_index("event_id").join(ar0).join(cars).reset_index()
+
+
+def aar_table(ar, by=None):
+    """
+    Aggregated table by event day: average abnormal return (AAR) across events, the
+    number of events, and the cumulative average abnormal return (CAAR) from the
+    first event-window day. `by` = a column of `ar` to split on (e.g. surprise_sign).
+    """
+    keys = ([by] if by else []) + ["rel_day"]
+    out = ar.groupby(keys)["ar"].agg(AAR="mean", n="size").reset_index()
+    out["CAAR"] = out.groupby(by)["AAR"].cumsum() if by else out["AAR"].cumsum()
+    return out
