@@ -429,3 +429,80 @@ def aar_table(ar, by=None):
     out = ar.groupby(keys)["ar"].agg(AAR="mean", n="size").reset_index()
     out["CAAR"] = out.groupby(by)["AAR"].cumsum() if by else out["AAR"].cumsum()
     return out
+
+
+# ---------------------------------------------------------------------------
+# Task 4: statistical tests
+# ---------------------------------------------------------------------------
+def t_test_mean(x, level=0.95):
+    """
+    Cross-sectional t-test that the mean of x is zero (x = one AR or CAR per event).
+    Uses the spread of the events' own values, so it allows for the higher volatility
+    around announcements. Returns n, mean, standard error, t, two-sided p and the CI.
+    """
+    from scipy import stats
+    x = pd.Series(x).dropna().astype(float)
+    n = len(x)
+    mean, se = x.mean(), x.std(ddof=1) / np.sqrt(n)
+    t = mean / se if se > 0 else np.nan
+    half = stats.t.ppf(0.5 + level / 2, n - 1) * se
+    return {"n": n, "mean": mean, "se": se, "t": t, "p": 2 * stats.t.sf(abs(t), n - 1),
+            "ci_low": mean - half, "ci_high": mean + half}
+
+
+def welch_diff(a, b):
+    """Welch t-test that mean(a) - mean(b) is zero (unequal group sizes and variances)."""
+    from scipy import stats
+    a, b = pd.Series(a).dropna(), pd.Series(b).dropna()
+    t, p = stats.ttest_ind(a, b, equal_var=False)
+    return {"difference": a.mean() - b.mean(), "t": t, "p": p}
+
+
+def date_clustered_t(values, dates):
+    """
+    Robustness: events announced on the same day share market-wide news, so they are not
+    fully independent. Average the values by day 0 first, then t-test across those dates.
+    """
+    by_date = pd.Series(np.asarray(values, dtype=float), index=pd.to_datetime(dates)).groupby(level=0).mean()
+    out = t_test_mean(by_date)
+    out["n_dates"] = out.pop("n")
+    return out
+
+
+def aar_caar_ci(ar, level=0.95):
+    """
+    By event day: AAR and CAAR with t-statistics and confidence intervals.
+    CAAR's interval uses each event's own running CAR from day -10, so it allows for
+    correlation between an event's daily ARs instead of adding up daily variances.
+    """
+    ar = ar.sort_values(["event_id", "rel_day"]).copy()
+    ar["cum"] = ar.groupby("event_id")["ar"].cumsum()
+    rows = []
+    for d, g in ar.groupby("rel_day"):
+        a, c = t_test_mean(g["ar"], level), t_test_mean(g["cum"], level)
+        rows.append({"rel_day": d, "n": a["n"], "AAR": a["mean"], "AAR_t": a["t"], "AAR_p": a["p"],
+                     "AAR_low": a["ci_low"], "AAR_high": a["ci_high"],
+                     "CAAR": c["mean"], "CAAR_t": c["t"], "CAAR_p": c["p"],
+                     "CAAR_low": c["ci_low"], "CAAR_high": c["ci_high"]})
+    return pd.DataFrame(rows)
+
+
+def car_test_table(cars, col, by, cost_bp=20, level=0.95):
+    """
+    One row per group: number of events, mean CAR and its 95% CI in basis points, t, p,
+    share of events with a positive CAR, the date-clustered t, and a verdict that
+    separates statistical significance (5%) from economic size (|mean| above cost_bp).
+    """
+    rows = []
+    for g, sub in cars.groupby(by):
+        s = t_test_mean(sub[col], level)
+        dc = date_clustered_t(sub[col], sub["day0"])
+        sig = s["p"] < 1 - level
+        big = abs(s["mean"]) * 1e4 > cost_bp
+        verdict = ("significant, economically meaningful" if sig and big else
+                   "significant but economically marginal" if sig else "not significant")
+        rows.append({by: g, "events": s["n"], "mean (bp)": s["mean"] * 1e4,
+                     "CI low (bp)": s["ci_low"] * 1e4, "CI high (bp)": s["ci_high"] * 1e4,
+                     "t": s["t"], "p": s["p"], "share > 0": (sub[col] > 0).mean(),
+                     "t (by date)": dc["t"], "verdict": verdict})
+    return pd.DataFrame(rows).set_index(by)

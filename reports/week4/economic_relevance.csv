@@ -1,0 +1,5 @@
+window,surprise,mean (bp),t,significant at 5%,|mean| > 20 bp,net of 20 bp cost (bp),tradable after the news?
+"CAR(-1,+1)",positive,97.59445443707514,3.7185898412322294,True,True,77.59445443707514,no: needs the surprise before it is announced
+"CAR(-1,+1)",negative,-345.5091071501129,-3.6828074512250213,True,True,325.5091071501129,no: needs the surprise before it is announced
+"CAR(+2,+10)",positive,23.62505262196893,1.2159695871213645,False,True,3.62505262196893,yes: enter at the close of day +1
+"CAR(+2,+10)",negative,-52.754843526199366,-1.0809153561603246,False,True,32.754843526199366,yes: enter at the close of day +1
